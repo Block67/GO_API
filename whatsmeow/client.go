@@ -3,6 +3,8 @@ package whatsmeow
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -16,47 +18,83 @@ import (
 )
 
 type WhatsAppClient struct {
-	Client *whatsmeow.Client
+	Client   *whatsmeow.Client
+	QRCode   string
+	QRCodeMu sync.Mutex
+	QRChan   chan string
+	UserID   int
 }
 
-// Initialiser le client WhatsApp
-func NewWhatsAppClient() (*WhatsAppClient, error) {
-	// Logger
-	logger := waLog.Stdout("WhatsApp", "DEBUG", true)
+type WhatsAppClientManager struct {
+	clients map[int]*WhatsAppClient
+	mu      sync.Mutex
+	store   *sqlstore.Container
+}
 
-	// Base de données SQLite pour les sessions
+func NewWhatsAppClientManager(dbPath string) (*WhatsAppClientManager, error) {
 	dbLog := waLog.Stdout("Database", "DEBUG", true)
-	container, err := sqlstore.New("sqlite", "file:whatsapp_sessions.db?_pragma=foreign_keys(1)", dbLog)
+	container, err := sqlstore.New("sqlite", fmt.Sprintf("file:%s?_pragma=foreign_keys(1)", dbPath), dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %v", err)
 	}
 
-	// Récupération ou création d’un appareil
-	deviceStore, err := container.GetFirstDevice()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get device: %v", err)
-	}
-
-	// Initialisation du client
-	client := whatsmeow.NewClient(deviceStore, logger)
-	client.AddEventHandler(eventHandler)
-
-	return &WhatsAppClient{Client: client}, nil
+	return &WhatsAppClientManager{
+		clients: make(map[int]*WhatsAppClient),
+		store:   container,
+	}, nil
 }
 
-// Gestion des événements
-func eventHandler(evt interface{}) {
+func (m *WhatsAppClientManager) NewClientForUser(userID int) (*WhatsAppClient, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if client, exists := m.clients[userID]; exists {
+		return client, nil
+	}
+
+	logger := waLog.Stdout(fmt.Sprintf("WhatsApp-User-%d", userID), "DEBUG", true)
+
+	// Utilise NewDevice() sans arguments avec la version actuelle de whatsmeow
+	device := m.store.NewDevice()
+
+	client := whatsmeow.NewClient(device, logger)
+
+	wc := &WhatsAppClient{
+		Client: client,
+		QRChan: make(chan string, 1),
+		UserID: userID,
+	}
+	client.AddEventHandler(wc.eventHandler)
+
+	m.clients[userID] = wc
+	return wc, nil
+}
+
+func (m *WhatsAppClientManager) GetClient(userID int) *WhatsAppClient {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.clients[userID]
+}
+
+func (wc *WhatsAppClient) eventHandler(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.QR:
-		fmt.Printf("QR Code: %s\n", v.Codes[0])
+		wc.QRCodeMu.Lock()
+		wc.QRCode = v.Codes[0] // Stocke le premier code QR
+		wc.QRCodeMu.Unlock()
+		fmt.Printf("QR Code for user %d: %s\n", wc.UserID, v.Codes[0])
+		select {
+		case wc.QRChan <- v.Codes[0]: // Envoie le code QR au canal
+		default:
+			// Évite le blocage si le canal est déjà rempli
+		}
 	case *events.Connected:
-		fmt.Println("Connected to WhatsApp!")
+		fmt.Printf("User %d connected to WhatsApp!\n", wc.UserID)
 	case *events.Disconnected:
-		fmt.Println("Disconnected from WhatsApp.")
+		fmt.Printf("User %d disconnected from WhatsApp.\n", wc.UserID)
 	}
 }
 
-// Connexion
 func (wc *WhatsAppClient) Connect() error {
 	if wc.Client.IsConnected() {
 		return nil
@@ -64,25 +102,75 @@ func (wc *WhatsAppClient) Connect() error {
 	return wc.Client.Connect()
 }
 
-// Envoi de message texte
+func (wc *WhatsAppClient) GetQRCode() string {
+	wc.QRCodeMu.Lock()
+	defer wc.QRCodeMu.Unlock()
+	return wc.QRCode
+}
+
+func (wc *WhatsAppClient) WaitForQRCode(timeout time.Duration) (string, error) {
+	select {
+	case qrCode := <-wc.QRChan:
+		return qrCode, nil
+	case <-time.After(timeout):
+		return "", fmt.Errorf("timeout waiting for QR code")
+	}
+}
+
 func (wc *WhatsAppClient) SendMessage(to, message string) error {
-	// Parse le JID
 	recipient, err := types.ParseJID(to)
 	if err != nil {
 		return fmt.Errorf("invalid JID: %v", err)
 	}
 
-	// Crée le message texte
 	msg := &waProto.Message{
 		Conversation: proto.String(message),
 	}
 
-	// Envoie du message (note : seulement 3 paramètres requis)
 	resp, err := wc.Client.SendMessage(context.Background(), recipient, msg)
 	if err != nil {
 		return fmt.Errorf("failed to send message: %v", err)
 	}
 
-	fmt.Printf("Message sent, ID: %s\n", resp.ID)
+	fmt.Printf("Message sent for user %d, ID: %s\n", wc.UserID, resp.ID)
+	return nil
+}
+
+func (wc *WhatsAppClient) SendMedia(to, caption, mediaType string, mediaData []byte) error {
+	recipient, err := types.ParseJID(to)
+	if err != nil {
+		return fmt.Errorf("invalid JID: %v", err)
+	}
+
+	var msg *waProto.Message
+	switch mediaType {
+	case "image":
+		msg = &waProto.Message{
+			ImageMessage: &waProto.ImageMessage{
+				Caption:       proto.String(caption),
+				JPEGThumbnail: mediaData, // Champ corrigé
+			},
+		}
+	case "audio":
+		msg = &waProto.Message{
+			AudioMessage: &waProto.AudioMessage{
+				Mimetype: proto.String("audio/ogg; codecs=opus"), // Champ corrigé
+			},
+		}
+	case "document":
+		msg = &waProto.Message{
+			DocumentMessage: &waProto.DocumentMessage{
+				Title:    proto.String(caption),
+				FileName: proto.String(caption),
+			},
+		}
+	default:
+		return fmt.Errorf("unsupported media type")
+	}
+
+	_, err = wc.Client.SendMessage(context.Background(), recipient, msg)
+	if err != nil {
+		return fmt.Errorf("failed to send media: %v", err)
+	}
 	return nil
 }
