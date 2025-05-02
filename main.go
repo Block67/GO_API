@@ -34,7 +34,7 @@ func main() {
 
 	// Initialiser les gestionnaires
 	userHandler := handlers.NewUserHandler(userStore)
-	authHandler := handlers.NewAuthHandler(clientManager) // Passer clientManager ici
+	authHandler := handlers.NewAuthHandler(clientManager)
 	messageHandler := handlers.NewMessageHandler(clientManager, scheduler)
 
 	// Routes publiques
